@@ -2,7 +2,7 @@
 
 ## About the Project
 
-The goal of this project is to build a simple data pipeline that collects movie information, cleans it, adds extra details, and stores everything in a database for analysis.
+The goal of this project is to build a simple data pipeline that collects movie information, cleans it, enriches it with additional details, and stores everything in a relational database for analysis.
 
 For this project, I used the MovieLens dataset, which contains information about movies and the ratings given by users. I also integrated the OMDb API to retrieve additional details about movies, such as their director, plot, box office collection, and IMDb ID.
 
@@ -43,11 +43,11 @@ I also removed invalid ratings and ratings that refer to movies not present in t
 
 ### 3. Enriching Movie Information
 
-MovieLens does not provide every detail needed for this project, so I integrated the OMDb API.
+MovieLens does not provide all the details required for this project, so I integrated the OMDb API to retrieve additional movie information, including director, plot, box office collection, and IMDb ID.
 
-For example, the API can provide a movie's director, plot, box office collection, and IMDb ID. I implemented caching so that previously processed movies do not need to be requested again unnecessarily.
+I implemented an OMDb cache table to store previously retrieved responses and reduce unnecessary API requests. Successfully enriched movies are skipped during subsequent runs, while unsuccessful lookups can be retried.
 
-To manage API usage, the pipeline processes a limited number of new movie lookups during each run. Therefore, additional movie details are populated gradually as more batches are processed.
+The pipeline also supports batch processing through an enrichment limit configured in the `.env` file. Due to OMDb API request limits, enrichment is currently available for only a subset of movies. Missing metadata does not prevent the remaining MovieLens data from being loaded into the database.
 
 ### 4. Loading the Data into SQLite
 
@@ -73,15 +73,22 @@ The tables are connected using movie IDs and genre IDs, which helps maintain dat
 
 Follow these steps to run the project on your computer.
 
-### Step 1: Install the Required Libraries
+### Step 1: Clone the Repository
+
+```bash
+git clone https://github.com/Thanusree-p/movie-data-pipeline.git
+cd movie-data-pipeline
+```
+
+### Step 2: Install the Required Libraries
 
 Open the terminal in the project folder and run:
 
 ```bash
-pip install pandas requests python-dotenv
+pip install -r requirements.txt
 ```
 
-### Step 2: Configure the OMDb API
+### Step 3: Configure the OMDb API
 
 Create a `.env` file in the project folder and add your API key:
 
@@ -92,9 +99,9 @@ OMDB_ENRICH_LIMIT=100
 
 Replace `your_api_key_here` with your own API key. Keep this file private and do not upload it to GitHub.
 
-The enrichment limit controls how many new OMDb lookups are attempted in one run.
+The enrichment limit controls how many new movie lookups are attempted in one run.
 
-### Step 3: Create the Database
+### Step 4: Create the Database
 
 Run the following command when setting up a fresh database:
 
@@ -106,7 +113,7 @@ This creates the database tables using the definitions in `schema.sql`.
 
 **Note:** Run this during initial setup only. Do not delete or recreate an existing database that already contains your loaded data.
 
-### Step 4: Run the ETL Pipeline
+### Step 5: Run the ETL Pipeline
 
 Run:
 
@@ -114,9 +121,9 @@ Run:
 python etl.py
 ```
 
-The script reads the CSV files, cleans the data, attempts OMDb enrichment, and loads the full MovieLens dataset into SQLite.
+The script reads the CSV files, cleans the data, attempts OMDb enrichment, and loads the MovieLens dataset into SQLite.
 
-### Step 5: Verify the Data
+### Step 6: Verify the Data
 
 To check the records stored in the database, run:
 
@@ -124,7 +131,7 @@ To check the records stored in the database, run:
 python verify_database.py
 ```
 
-### Step 6: Run the SQL Queries
+### Step 7: Run the SQL Queries
 
 To execute the analytical queries, run:
 
@@ -138,12 +145,14 @@ The results will be displayed in the terminal.
 
 I wrote SQL queries to answer the following questions:
 
-1. Which movie has the highest average rating?
+1. Which movie or movies have the highest average rating?
 2. What are the top 5 movie genres with the highest average rating?
-3. Who is the director with the most movies in the dataset?
+3. Which director has the most movies?
 4. What is the average rating of movies released each year?
 
-The director analysis depends on the director information successfully retrieved from OMDb. Since enrichment is currently incomplete, the director result may not represent the entire dataset.
+The queries use SQL aggregation, joins, grouping, and sorting to analyze the data.
+
+**Note:** The director analysis depends on the director information successfully retrieved from OMDb. Since enrichment is currently incomplete, the director result represents only the available enriched records and may not represent the entire MovieLens dataset.
 
 ## Results So Far
 
@@ -154,17 +163,29 @@ After running the pipeline, the SQLite database contains:
 - **19 genres**
 - **22,050 movie-genre relationships**
 
-The pipeline has also successfully retrieved and cached OMDb responses in batches.
+The OMDb cache contains 905 processed records:
 
-The MovieLens dataset is fully loaded, but OMDb enrichment is still partial. This means director, plot, box office, and IMDb information is not yet available for every movie.
+- **646 successful metadata retrievals**
+- **259 unsuccessful lookups**
 
-I tested the pipeline by running it more than once. The main MovieLens table counts remained unchanged, confirming that repeated runs did not create duplicate movie or rating records.
+The MovieLens dataset is fully loaded, while OMDb enrichment is partial because of API request limits. Movies without retrieved metadata remain available in the database with their original MovieLens information.
+
+The analytical SQL queries execute successfully:
+
+- **Highest average rating:** 296 movies are tied with an average rating of 5.0.
+- **Top 5 genres:** Documentary, Film-Noir, War, Animation, and Drama.
+- **Director with most movies:** Alfred Hitchcock, with 9 movies among the currently enriched records.
+- **Average rating by release year:** Results are available for 106 release years.
+
+I also tested repeated pipeline execution and verified that the main MovieLens movie and rating counts remained unchanged, demonstrating that repeated runs do not create duplicate movie or rating records.
 
 ## Challenges and Improvements
 
 One challenge was handling relationships between database tables. For example, ratings must refer to movies that already exist in the database. I addressed this by loading the movie records before storing related OMDb cache entries.
 
-Another consideration was the OMDb API request limit. To manage this, I added a cache and limited the number of new requests per run.
+Another challenge was handling movie title mismatches while retrieving information from the OMDb API. I used title and release-year information to improve movie matching and reduce incorrect metadata associations.
+
+The OMDb API request limit was another consideration. To manage this, I implemented caching and limited the number of new requests per run. The pipeline also handles missing metadata without interrupting the loading of the main dataset.
 
 As a future improvement, I would complete the remaining OMDb enrichment as API limits permit, add more automated data-quality checks, and explore deploying the pipeline using Azure data services and Snowflake.
 

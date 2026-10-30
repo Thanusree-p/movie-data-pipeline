@@ -7,15 +7,16 @@ import requests
 import pandas as pd
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 API_KEY = os.getenv("OMDB_API_KEY")
+
 MOVIES_FILE = "data/movies.csv"
 RATINGS_FILE = "data/ratings.csv"
 DATABASE_FILE = "movies.db"
 
 # Maximum NEW OMDb requests per run.
-# Override this in .env when you want a larger batch.
 OMDB_ENRICH_LIMIT = int(os.getenv("OMDB_ENRICH_LIMIT", "100"))
 
 
@@ -37,9 +38,11 @@ def clean_movies(movies):
     movies = movies.copy()
 
     movies = movies.dropna(subset=["movieId", "title"])
+
     movies["movieId"] = pd.to_numeric(
         movies["movieId"], errors="coerce"
     )
+
     movies = movies.dropna(subset=["movieId"])
 
     movies = movies[
@@ -52,6 +55,7 @@ def clean_movies(movies):
     movies["genres"] = movies["genres"].astype("string").str.strip()
 
     movies = movies[movies["title"] != ""]
+
     movies = movies.drop_duplicates(
         subset=["movieId"], keep="first"
     )
@@ -121,6 +125,7 @@ def transform_data(movies, ratings):
     ratings_clean = clean_ratings(ratings)
 
     valid_movie_ids = set(movies_clean["movieId"])
+
     ratings_clean = ratings_clean[
         ratings_clean["movieId"].isin(valid_movie_ids)
     ].copy()
@@ -146,12 +151,17 @@ def create_cache_table(conn):
             FOREIGN KEY (movie_id) REFERENCES movies(movie_id)
         )
     """)
+
     conn.commit()
 
 
+def normalize_title(title):
+    """Normalize titles for comparison."""
+    return re.sub(r"[^a-z0-9]", "", title.lower())
 
 
 def fetch_movie_details(title):
+
     if not API_KEY:
         raise ValueError(
             "OMDB_API_KEY is missing. Check your .env file."
@@ -163,16 +173,17 @@ def fetch_movie_details(title):
     year = match.group(1) if match else None
 
     # Remove the final year from the title
-    search_title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+    search_title = re.sub(
+        r"\s*\(\d{4}\)\s*$", "", title
+    ).strip()
 
-    # Remove alternate-title annotations such as (a.k.a. Se7en)
+    # Remove alternate-title annotations
     search_title = re.sub(
         r"\s*\(a\.k\.a\..*?\)",
         "",
         search_title,
         flags=re.IGNORECASE
     ).strip()
-
 
     params = {
         "apikey": API_KEY,
@@ -189,11 +200,21 @@ def fetch_movie_details(title):
             params=params,
             timeout=15
         )
+
         response.raise_for_status()
         data = response.json()
 
-        # If exact-title search fails, try a flexible search
+        # If exact-title search fails, try fallback search
         if data.get("Response") != "True" and "Error" in data:
+
+            error_message = data.get("Error", "").lower()
+
+            # Do not continue if API limit or authentication fails
+            if any(word in error_message for word in [
+                "limit", "invalid api key", "unauthorized"
+            ]):
+                return None
+
             fallback_params = {
                 "apikey": API_KEY,
                 "s": search_title,
@@ -208,25 +229,72 @@ def fetch_movie_details(title):
                 params=fallback_params,
                 timeout=15
             )
+
             fallback_response.raise_for_status()
             fallback_data = fallback_response.json()
 
-            # Use the first search result's IMDb ID to fetch details
-            if fallback_data.get("Response") == "True":
-                first_result = fallback_data["Search"][0]
-                imdb_id = first_result.get("imdbID")
+            fallback_error = fallback_data.get("Error", "").lower()
 
-                if imdb_id:
-                    details_response = requests.get(
-                        "https://www.omdbapi.com/",
-                        params={
-                            "apikey": API_KEY,
-                            "i": imdb_id
-                        },
-                        timeout=15
+            if any(word in fallback_error for word in [
+                "limit", "invalid api key", "unauthorized"
+            ]):
+                return None
+
+            # Verify fallback search results
+            if fallback_data.get("Response") == "True":
+
+                matching_result = None
+
+                for result in fallback_data.get("Search", []):
+
+                    result_title = result.get("Title", "").strip()
+                    result_year = result.get("Year", "").strip()
+
+                    title_matches = (
+                        normalize_title(result_title)
+                        == normalize_title(search_title)
                     )
-                    details_response.raise_for_status()
-                    data = details_response.json()
+
+                    year_matches = (
+                        not year or result_year == year
+                    )
+
+                    if title_matches and year_matches:
+                        matching_result = result
+                        break
+
+                if matching_result:
+
+                    imdb_id = matching_result.get("imdbID")
+
+                    if imdb_id:
+
+                        details_response = requests.get(
+                            "https://www.omdbapi.com/",
+                            params={
+                                "apikey": API_KEY,
+                                "i": imdb_id
+                            },
+                            timeout=15
+                        )
+
+                        details_response.raise_for_status()
+                        data = details_response.json()
+
+                    else:
+                        data = {
+                            "Response": "False",
+                            "Error": "Matching movie has no IMDb ID"
+                        }
+
+                else:
+                    data = {
+                        "Response": "False",
+                        "Error": "No matching movie title and year found"
+                    }
+
+            else:
+                data = fallback_data
 
     except (requests.RequestException, ValueError) as error:
         print(f"Temporary OMDb error for {title}: {error}")
@@ -242,11 +310,15 @@ def fetch_movie_details(title):
         }
 
     error_message = data.get("Error", "Unknown OMDb error")
-    print(f"OMDb did not return details for {title}: {error_message}")
 
-    # Do not cache API-limit or service errors as missing movies
-    if any(word in error_message.lower()
-           for word in ["limit", "invalid api key", "unauthorized"]):
+    print(
+        f"OMDb did not return details for {title}: {error_message}"
+    )
+
+    # Do not cache API-limit or authentication errors
+    if any(word in error_message.lower() for word in [
+        "limit", "invalid api key", "unauthorized"
+    ]):
         return None
 
     return {
@@ -258,18 +330,19 @@ def fetch_movie_details(title):
     }
 
 
-
 def enrich_uncached_movies(conn, movies, limit):
+
     cached_ids = {
-    row[0]
-    for row in conn.execute(
-        """
-        SELECT movie_id
-        FROM omdb_cache
-        WHERE response_found = 1
-        """
-    ).fetchall()
-}
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT movie_id
+            FROM omdb_cache
+            WHERE response_found = 1
+            """
+        ).fetchall()
+    }
+
     pending_movies = movies[
         ~movies["movieId"].isin(cached_ids)
     ]
@@ -279,11 +352,16 @@ def enrich_uncached_movies(conn, movies, limit):
     print(f"\nMovies needing OMDb lookup: {len(pending_movies)}")
     print(f"New OMDb requests planned this run: {len(batch)}")
 
-    for position, (_, movie) in enumerate(batch.iterrows(), start=1):
+    for position, (_, movie) in enumerate(
+        batch.iterrows(), start=1
+    ):
+
         movie_id = int(movie["movieId"])
+
         details = fetch_movie_details(str(movie["title"]))
 
         if details is not None:
+
             conn.execute(
                 """
                 INSERT OR REPLACE INTO omdb_cache
@@ -300,6 +378,7 @@ def enrich_uncached_movies(conn, movies, limit):
                     details["response_found"]
                 )
             )
+
             conn.commit()
 
         print(
@@ -316,12 +395,14 @@ def enrich_uncached_movies(conn, movies, limit):
 # -------------------- LOAD --------------------
 
 def load_all_data(conn, movies, ratings):
+
     conn.execute("PRAGMA foreign_keys = ON")
 
     movie_rows = []
     genre_links = []
 
     for movie in movies.itertuples(index=False):
+
         movie_id = int(movie.movieId)
 
         cached = conn.execute(
@@ -354,6 +435,7 @@ def load_all_data(conn, movies, ratings):
         ))
 
         for genre in movie.genres_list:
+
             conn.execute(
                 """
                 INSERT OR IGNORE INTO genres (genre_name)
@@ -375,6 +457,7 @@ def load_all_data(conn, movies, ratings):
         (movie_id, title, release_year, director, plot,
          box_office, imdb_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
+
         ON CONFLICT(movie_id) DO UPDATE SET
             title = excluded.title,
             release_year = excluded.release_year,
@@ -401,6 +484,7 @@ def load_all_data(conn, movies, ratings):
         INSERT INTO ratings
         (user_id, movie_id, rating, rating_timestamp)
         VALUES (?, ?, ?, ?)
+
         ON CONFLICT(user_id, movie_id) DO UPDATE SET
             rating = excluded.rating,
             rating_timestamp = excluded.rating_timestamp
@@ -419,24 +503,29 @@ def load_all_data(conn, movies, ratings):
     conn.commit()
 
     print("\nFull dataset loaded successfully!")
+
     print(
         "Movies in database:",
         conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
     )
+
     print(
         "Ratings in database:",
         conn.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
     )
+
     print(
         "Genres in database:",
         conn.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
     )
+
     print(
         "Movie-genre links:",
         conn.execute(
             "SELECT COUNT(*) FROM movie_genres"
         ).fetchone()[0]
     )
+
     print(
         "Cached OMDb responses:",
         conn.execute("SELECT COUNT(*) FROM omdb_cache").fetchone()[0]
@@ -445,10 +534,13 @@ def load_all_data(conn, movies, ratings):
 
 # -------------------- MAIN PIPELINE --------------------
 
-
 def run_etl():
+
     movies, ratings = extract_data()
-    movies_clean, ratings_clean = transform_data(movies, ratings)
+
+    movies_clean, ratings_clean = transform_data(
+        movies, ratings
+    )
 
     conn = sqlite3.connect(DATABASE_FILE)
 
@@ -458,20 +550,17 @@ def run_etl():
         # Step 1: Create the cache table
         create_cache_table(conn)
 
-        # Step 2: Load all movies and ratings first
-        # This ensures referenced movie IDs exist.
+        # Step 2: Load movies and ratings first
         load_all_data(conn, movies_clean, ratings_clean)
 
         # Step 3: Enrich movies using OMDb
-        # Cached results are reused on subsequent runs.
         enrich_uncached_movies(
             conn,
             movies_clean,
             OMDB_ENRICH_LIMIT
         )
 
-        # Step 4: Apply newly retrieved OMDb details
-        # to the existing movies table.
+        # Step 4: Apply retrieved OMDb details
         load_all_data(conn, movies_clean, ratings_clean)
 
         print("\nETL pipeline completed successfully.")
@@ -486,4 +575,3 @@ def run_etl():
 
 if __name__ == "__main__":
     run_etl()
-
