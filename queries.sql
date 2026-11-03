@@ -1,24 +1,20 @@
 
 
--- 1. Find the movie(s) with the highest average rating.
+-- Query 1: Top 10 highest-rated movies
+-- Consider only movies with at least 20 ratings
+
 SELECT
     m.movie_id,
     m.title,
     ROUND(AVG(r.rating), 2) AS average_rating,
     COUNT(r.rating) AS total_ratings
-FROM movies AS m
-JOIN ratings AS r
+FROM movies m
+JOIN ratings r
     ON m.movie_id = r.movie_id
 GROUP BY m.movie_id, m.title
-HAVING AVG(r.rating) = (
-    SELECT MAX(movie_avg)
-    FROM (
-        SELECT AVG(rating) AS movie_avg
-        FROM ratings
-        GROUP BY movie_id
-    )
-)
-ORDER BY m.title;
+HAVING COUNT(r.rating) >= 20
+ORDER BY average_rating DESC, total_ratings DESC
+LIMIT 10;
 
 
 

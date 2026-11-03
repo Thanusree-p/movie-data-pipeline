@@ -5,8 +5,11 @@ import sqlite3
 import time
 import requests
 import pandas as pd
+
 from dotenv import load_dotenv
 
+
+# -------------------- CONFIGURATION --------------------
 
 load_dotenv()
 
@@ -19,10 +22,13 @@ DATABASE_FILE = "movies.db"
 # Maximum NEW OMDb requests per run.
 OMDB_ENRICH_LIMIT = int(os.getenv("OMDB_ENRICH_LIMIT", "100"))
 
+OMDB_URL = "https://www.omdbapi.com/"
+
 
 # -------------------- EXTRACT --------------------
 
 def extract_data():
+
     movies = pd.read_csv(MOVIES_FILE)
     ratings = pd.read_csv(RATINGS_FILE)
 
@@ -35,6 +41,7 @@ def extract_data():
 # -------------------- TRANSFORM --------------------
 
 def clean_movies(movies):
+
     movies = movies.copy()
 
     movies = movies.dropna(subset=["movieId", "title"])
@@ -79,9 +86,11 @@ def clean_movies(movies):
 
 
 def clean_ratings(ratings):
+
     ratings = ratings.copy()
 
     for column in ["userId", "movieId", "rating", "timestamp"]:
+
         ratings[column] = pd.to_numeric(
             ratings[column], errors="coerce"
         )
@@ -121,6 +130,7 @@ def clean_ratings(ratings):
 
 
 def transform_data(movies, ratings):
+
     movies_clean = clean_movies(movies)
     ratings_clean = clean_ratings(ratings)
 
@@ -140,6 +150,7 @@ def transform_data(movies, ratings):
 # -------------------- OMDb ENRICHMENT --------------------
 
 def create_cache_table(conn):
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS omdb_cache (
             movie_id INTEGER PRIMARY KEY,
@@ -155,9 +166,99 @@ def create_cache_table(conn):
     conn.commit()
 
 
+def clean_movie_title(title):
+    """
+    Extract release year and remove MovieLens
+    alternate-title annotations.
+    """
+
+    title = str(title).strip()
+
+    year_match = re.search(r"\((\d{4})\)\s*$", title)
+    year = year_match.group(1) if year_match else None
+
+    # Remove final release year.
+    title = re.sub(r"\s*\(\d{4}\)\s*$", "", title)
+
+    # Remove alternate-title annotations.
+    title = re.sub(r"\s*\([^)]*\)", "", title)
+
+    title = title.strip()
+
+    # Convert "Mask, The" into "The Mask".
+    article_match = re.match(
+        r"^(.*),\s*(The|A|An)$",
+        title,
+        flags=re.IGNORECASE
+    )
+
+    if article_match:
+        title = article_match.group(2) + " " + article_match.group(1)
+
+    return title.strip(), year
+
+
+def prepare_omdb_search_title(title):
+    """
+    Convert common number words into digits
+    before searching OMDb.
+    """
+
+    number_words = {
+        "twelve": "12",
+        "eleven": "11",
+        "ten": "10",
+        "nine": "9",
+        "eight": "8",
+        "seven": "7",
+        "six": "6",
+        "five": "5",
+        "four": "4",
+        "three": "3",
+        "two": "2",
+        "one": "1"
+    }
+
+    title = str(title)
+
+    for word, number in number_words.items():
+
+        title = re.sub(
+            rf"\b{word}\b",
+            number,
+            title,
+            flags=re.IGNORECASE
+        )
+
+    return title
+
+
 def normalize_title(title):
-    """Normalize titles for comparison."""
-    return re.sub(r"[^a-z0-9]", "", title.lower())
+    """
+    Normalize titles for comparison.
+    Handles punctuation, articles and common number variations.
+    """
+
+    title = str(title).lower().strip()
+
+    # Convert trailing articles:
+    # "Mask, The" -> "The Mask".
+    article_match = re.match(
+        r"^(.*),\s*(the|a|an)$",
+        title
+    )
+
+    if article_match:
+        title = article_match.group(2) + " " + article_match.group(1)
+
+    # Standardize number words.
+    title = prepare_omdb_search_title(title)
+
+    # Remove leading articles.
+    title = re.sub(r"^(the|a|an)\s+", "", title)
+
+    # Remove punctuation, spaces and special characters.
+    return re.sub(r"[^a-z0-9]", "", title)
 
 
 def fetch_movie_details(title):
@@ -167,36 +268,34 @@ def fetch_movie_details(title):
             "OMDB_API_KEY is missing. Check your .env file."
         )
 
-    # Extract the final release year
-    match = re.search(r"\((\d{4})\)\s*$", title)
+    search_title, year = clean_movie_title(title)
 
-    year = match.group(1) if match else None
+    omdb_search_title = prepare_omdb_search_title(search_title)
 
-    # Remove the final year from the title
-    search_title = re.sub(
-        r"\s*\(\d{4}\)\s*$", "", title
-    ).strip()
-
-    # Remove alternate-title annotations
-    search_title = re.sub(
-        r"\s*\(a\.k\.a\..*?\)",
-        "",
-        search_title,
-        flags=re.IGNORECASE
-    ).strip()
-
-    params = {
-        "apikey": API_KEY,
-        "t": search_title,
-        "type": "movie"
-    }
-
-    if year:
-        params["y"] = year
+    if not search_title:
+        return {
+            "director": None,
+            "plot": None,
+            "box_office": None,
+            "imdb_id": None,
+            "response_found": 0
+        }
 
     try:
+
+        # Step 1: Search using title and year.
+
+        params = {
+            "apikey": API_KEY,
+            "t": omdb_search_title,
+            "type": "movie"
+        }
+
+        if year:
+            params["y"] = year
+
         response = requests.get(
-            "https://www.omdbapi.com/",
+            OMDB_URL,
             params=params,
             timeout=15
         )
@@ -204,145 +303,151 @@ def fetch_movie_details(title):
         response.raise_for_status()
         data = response.json()
 
-        # If exact-title search fails, try fallback search
-        if data.get("Response") != "True" and "Error" in data:
+        # Step 2: Verify whether the first result title matches.
 
-            error_message = data.get("Error", "").lower()
+        title_matches = (
+            data.get("Response") == "True"
+            and normalize_title(data.get("Title", ""))
+            == normalize_title(omdb_search_title)
+        )
 
-            # Do not continue if API limit or authentication fails
-            if any(word in error_message for word in [
-                "limit", "invalid api key", "unauthorized"
-            ]):
-                return None
+        # Step 3: Retry without year if the first result
+        # is missing or its title does not match.
 
-            fallback_params = {
-                "apikey": API_KEY,
-                "s": search_title,
-                "type": "movie"
-            }
+        if not title_matches:
 
-            if year:
-                fallback_params["y"] = year
+            params.pop("y", None)
 
-            fallback_response = requests.get(
-                "https://www.omdbapi.com/",
-                params=fallback_params,
+            response = requests.get(
+                OMDB_URL,
+                params=params,
                 timeout=15
             )
 
-            fallback_response.raise_for_status()
-            fallback_data = fallback_response.json()
+            response.raise_for_status()
+            data = response.json()
 
-            fallback_error = fallback_data.get("Error", "").lower()
+        # Step 4: Verify the returned title.
 
-            if any(word in fallback_error for word in [
-                "limit", "invalid api key", "unauthorized"
-            ]):
-                return None
+        if data.get("Response") != "True":
+            raise ValueError(
+                data.get("Error", "Movie not found")
+            )
 
-            # Verify fallback search results
-            if fallback_data.get("Response") == "True":
+        result_title = data.get("Title", "")
+        imdb_id = data.get("imdbID")
 
-                matching_result = None
+        if normalize_title(result_title) != normalize_title(omdb_search_title):
+            raise ValueError(
+                f"Movie title does not match: {result_title}"
+            )
 
-                for result in fallback_data.get("Search", []):
+        if not imdb_id:
+            raise ValueError("IMDb ID missing from OMDb response")
 
-                    result_title = result.get("Title", "").strip()
-                    result_year = result.get("Year", "").strip()
+        # Step 5: Retrieve full details using the IMDb ID.
 
-                    title_matches = (
-                        normalize_title(result_title)
-                        == normalize_title(search_title)
-                    )
+        details_response = requests.get(
+            OMDB_URL,
+            params={
+                "apikey": API_KEY,
+                "i": imdb_id
+            },
+            timeout=15
+        )
 
-                    year_matches = (
-                        not year or result_year == year
-                    )
+        details_response.raise_for_status()
+        details = details_response.json()
 
-                    if title_matches and year_matches:
-                        matching_result = result
-                        break
+        if details.get("Response") != "True":
+            raise ValueError("Could not retrieve IMDb details")
 
-                if matching_result:
+        # Step 6: Verify IMDb ID and detailed movie title.
 
-                    imdb_id = matching_result.get("imdbID")
+        if details.get("imdbID") != imdb_id:
+            raise ValueError("IMDb ID verification failed")
 
-                    if imdb_id:
+        if normalize_title(details.get("Title", "")) != normalize_title(omdb_search_title):
+            raise ValueError("Detailed movie title does not match")
 
-                        details_response = requests.get(
-                            "https://www.omdbapi.com/",
-                            params={
-                                "apikey": API_KEY,
-                                "i": imdb_id
-                            },
-                            timeout=15
-                        )
+        # Step 7: Verify release year.
+        # Do not automatically accept a different year.
 
-                        details_response.raise_for_status()
-                        data = details_response.json()
+        omdb_year_match = re.search(
+            r"\d{4}",
+            details.get("Year", "")
+        )
 
-                    else:
-                        data = {
-                            "Response": "False",
-                            "Error": "Matching movie has no IMDb ID"
-                        }
+        omdb_year = (
+            omdb_year_match.group(0)
+            if omdb_year_match else None
+        )
 
-                else:
-                    data = {
-                        "Response": "False",
-                        "Error": "No matching movie title and year found"
-                    }
+        if year:
 
-            else:
-                data = fallback_data
+            if not omdb_year:
+                raise ValueError(
+                    "OMDb release year unavailable; cannot verify match"
+                )
 
-    except (requests.RequestException, ValueError) as error:
-        print(f"Temporary OMDb error for {title}: {error}")
-        return None
+            if int(year) != int(omdb_year):
+                raise ValueError(
+                    f"Release year mismatch: "
+                    f"MovieLens {year}, OMDb {omdb_year}"
+                )
 
-    if data.get("Response") == "True":
+        # Step 8: Return verified metadata.
+
         return {
-            "director": data.get("Director"),
-            "plot": data.get("Plot"),
-            "box_office": data.get("BoxOffice"),
-            "imdb_id": data.get("imdbID"),
+            "director": details.get("Director"),
+            "plot": details.get("Plot"),
+            "box_office": details.get("BoxOffice"),
+            "imdb_id": details.get("imdbID"),
             "response_found": 1
         }
 
-    error_message = data.get("Error", "Unknown OMDb error")
+    except (requests.RequestException, ValueError) as error:
 
-    print(
-        f"OMDb did not return details for {title}: {error_message}"
-    )
+        print(f"OMDb matching failed for {title}: {error}")
 
-    # Do not cache API-limit or authentication errors
-    if any(word in error_message.lower() for word in [
-        "limit", "invalid api key", "unauthorized"
-    ]):
-        return None
+        if isinstance(error, requests.RequestException):
+            return None
 
-    return {
-        "director": None,
-        "plot": None,
-        "box_office": None,
-        "imdb_id": None,
-        "response_found": 0
-    }
+        error_message = str(error).lower()
+
+        # Do not cache API-limit or authentication errors.
+        if any(word in error_message for word in [
+            "limit",
+            "invalid api key",
+            "unauthorized"
+        ]):
+            return None
+
+        return {
+            "director": None,
+            "plot": None,
+            "box_office": None,
+            "imdb_id": None,
+            "response_found": 0
+        }
+
 
 
 def enrich_uncached_movies(conn, movies, limit):
 
+    # Skip all movies already present in the cache,
+    # whether the previous lookup succeeded or failed.
     cached_ids = {
         row[0]
         for row in conn.execute(
             """
             SELECT movie_id
             FROM omdb_cache
-            WHERE response_found = 1
             """
         ).fetchall()
     }
 
+    # Select only movies that have never been checked.
     pending_movies = movies[
         ~movies["movieId"].isin(cached_ids)
     ]
@@ -390,6 +495,7 @@ def enrich_uncached_movies(conn, movies, limit):
             time.sleep(0.25)
 
     print("OMDb enrichment batch completed.")
+
 
 
 # -------------------- LOAD --------------------
@@ -545,22 +651,23 @@ def run_etl():
     conn = sqlite3.connect(DATABASE_FILE)
 
     try:
+
         conn.execute("PRAGMA foreign_keys = ON")
 
-        # Step 1: Create the cache table
+        # Step 1: Create the cache table.
         create_cache_table(conn)
 
-        # Step 2: Load movies and ratings first
+        # Step 2: Load movies and ratings first.
         load_all_data(conn, movies_clean, ratings_clean)
 
-        # Step 3: Enrich movies using OMDb
+        # Step 3: Enrich movies using OMDb.
         enrich_uncached_movies(
             conn,
             movies_clean,
             OMDB_ENRICH_LIMIT
         )
 
-        # Step 4: Apply retrieved OMDb details
+        # Step 4: Apply retrieved OMDb details.
         load_all_data(conn, movies_clean, ratings_clean)
 
         print("\nETL pipeline completed successfully.")

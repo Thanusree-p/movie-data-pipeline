@@ -33,5 +33,17 @@ CREATE TABLE IF NOT EXISTS ratings (
     FOREIGN KEY (movie_id) REFERENCES movies(movie_id)
 );
 
+-- OMDb API response cache
+CREATE TABLE IF NOT EXISTS omdb_cache (
+    movie_id INTEGER PRIMARY KEY,
+    director TEXT,
+    plot TEXT,
+    box_office TEXT,
+    imdb_id TEXT,
+    response_found INTEGER NOT NULL,
+    FOREIGN KEY (movie_id) REFERENCES movies(movie_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_ratings_movie_id
 ON ratings(movie_id);
+

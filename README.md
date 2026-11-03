@@ -45,7 +45,7 @@ I also removed invalid ratings and ratings that refer to movies not present in t
 
 MovieLens does not provide all the details required for this project, so I integrated the OMDb API to retrieve additional movie information, including director, plot, box office collection, and IMDb ID.
 
-I implemented an OMDb cache table to store previously retrieved responses and reduce unnecessary API requests. Successfully enriched movies are skipped during subsequent runs, while unsuccessful lookups can be retried.
+I implemented an OMDb cache table to store previously processed API responses and reduce unnecessary API requests. Movies that have already been processed are skipped during subsequent runs, preventing repeated requests for both successful and unsuccessful lookups.
 
 The pipeline also supports batch processing through an enrichment limit configured in the `.env` file. Due to OMDb API request limits, enrichment is currently available for only a subset of movies. Missing metadata does not prevent the remaining MovieLens data from being loaded into the database.
 
@@ -94,12 +94,12 @@ Create a `.env` file in the project folder and add your API key:
 
 ```text
 OMDB_API_KEY=your_api_key_here
-OMDB_ENRICH_LIMIT=100
+OMDB_ENRICH_LIMIT=50
 ```
 
 Replace `your_api_key_here` with your own API key. Keep this file private and do not upload it to GitHub.
 
-The enrichment limit controls how many new movie lookups are attempted in one run.
+The enrichment limit controls how many new movie lookups are attempted in one run. You can adjust this value depending on your API request limits.
 
 ### Step 4: Create the Database
 
@@ -145,12 +145,12 @@ The results will be displayed in the terminal.
 
 I wrote SQL queries to answer the following questions:
 
-1. Which movie or movies have the highest average rating?
+1. Which are the top 10 highest-rated movies, considering movies with at least 20 ratings?
 2. What are the top 5 movie genres with the highest average rating?
 3. Which director has the most movies?
 4. What is the average rating of movies released each year?
 
-The queries use SQL aggregation, joins, grouping, and sorting to analyze the data.
+The queries use SQL aggregation, joins, grouping, sorting, and Common Table Expressions (CTEs) to analyze the data.
 
 **Note:** The director analysis depends on the director information successfully retrieved from OMDb. Since enrichment is currently incomplete, the director result represents only the available enriched records and may not represent the entire MovieLens dataset.
 
@@ -163,18 +163,18 @@ After running the pipeline, the SQLite database contains:
 - **19 genres**
 - **22,050 movie-genre relationships**
 
-The OMDb cache contains 905 processed records:
+The OMDb cache contains **1,032 processed records**:
 
-- **646 successful metadata retrievals**
-- **259 unsuccessful lookups**
+- **796 successful metadata retrievals**
+- **236 unsuccessful lookups**
 
 The MovieLens dataset is fully loaded, while OMDb enrichment is partial because of API request limits. Movies without retrieved metadata remain available in the database with their original MovieLens information.
 
 The analytical SQL queries execute successfully:
 
-- **Highest average rating:** 296 movies are tied with an average rating of 5.0.
+- **Top 10 highest-rated movies:** The results include movies with at least 20 ratings. The highest average rating is 4.48.
 - **Top 5 genres:** Documentary, Film-Noir, War, Animation, and Drama.
-- **Director with most movies:** Alfred Hitchcock, with 9 movies among the currently enriched records.
+- **Director with most movies:** Alfred Hitchcock, with 11 movies among the currently enriched records.
 - **Average rating by release year:** Results are available for 106 release years.
 
 I also tested repeated pipeline execution and verified that the main MovieLens movie and rating counts remained unchanged, demonstrating that repeated runs do not create duplicate movie or rating records.
